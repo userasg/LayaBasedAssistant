@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 from ..engine import llm_lock, make_llm
 from .. import config
+from .cache import DecisionCache
 from .bridge import BridgeDriver, BridgeServer
 from .desktop import CuaCli, DesktopDriver, ensure_daemon
 from .manager import ComputerUse
@@ -66,7 +68,8 @@ def make_computer_use(predictor, ranker, bridge: BridgeServer | None, cli: CuaCl
             raise RuntimeError(st["detail"])
         return DesktopDriver(app, cli)
 
-    cu = ComputerUse(predictor, ranker, lambda t: make_planner(surface="a Mac app" if t == "desktop" else "a web browser"), driver_factory,
-                     domain, StepRecorder(recorder_path), llm_tiebreak=make_tiebreak(), own_domain=own_domain)
+    cu = ComputerUse(predictor, ranker, lambda t: make_planner(surface="a Mac app" if t == "desktop" else "a web browser", desktop=t == "desktop"), driver_factory,
+                     domain, StepRecorder(recorder_path), llm_tiebreak=make_tiebreak(), own_domain=own_domain,
+                     cache=DecisionCache(Path(recorder_path).parent / "decision_cache.json" if recorder_path else None))  # persisted only where the app persists its steps
     cu.worker = worker
     return cu

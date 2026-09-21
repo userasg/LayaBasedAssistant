@@ -32,6 +32,12 @@ ALIASES = {
     "textedit": "TextEdit", "text edit": "TextEdit", "safari": "Safari", "finder": "Finder", "app store": "App Store", "keynote": "Keynote",
     "pages": "Pages", "numbers": "Numbers", "spotify": "Spotify", "slack": "Slack", "zoom": "zoom.us", "whatsapp": "WhatsApp", "notion": "Notion",
 }
+# Apps that ship a command line, by the name people would type, then where the app bundle keeps it. An app with a CLI can open files and folders
+# from a shell far more reliably than it can be clicked, and a shell needs no accessibility permission.
+CLI_NAMES = {"Visual Studio Code": ("code",), "Cursor": ("cursor",), "Sublime Text": ("subl",), "Zed": ("zed",), "Windsurf": ("windsurf",)}
+BUNDLE_CLIS = {"Visual Studio Code": "Contents/Resources/app/bin/code", "Cursor": "Contents/Resources/app/bin/cursor",
+               "Sublime Text": "Contents/SharedSupport/bin/subl", "Zed": "Contents/MacOS/cli", "Windsurf": "Contents/Resources/app/bin/windsurf"}
+SHELL_PATH = "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin"  # what `mac_run`'s shell sees (see host._env)
 _FILLER = re.compile(r"\b(the|my|apple|app|application|please|program)\b", re.I)
 
 
@@ -98,6 +104,25 @@ class AppCatalog:
             return bool(info.get("NSAppleScriptEnabled"))
         except Exception:
             return False
+
+
+    def cli(self, name: str) -> str | None:
+        """The command that drives this app from a shell (`code`, or the full path inside the bundle when it was never put on PATH), or None."""
+        import shutil
+
+        for cmd in CLI_NAMES.get(name, ()):
+            if shutil.which(cmd, path=SHELL_PATH):
+                return cmd
+        rel, path = BUNDLE_CLIS.get(name), self.paths.get(name)
+        if rel and path and os.access(os.path.join(path, rel), os.X_OK):
+            return "'" + os.path.join(path, rel) + "'"
+        return None
+
+    def dictionary(self, name: str) -> str:
+        """A compact digest of the app's scripting dictionary (commands, classes, properties), "" when it has none. See cua/sdef.py."""
+        from . import sdef
+
+        return sdef.digest(name, self.paths.get(name))
 
 
 @dataclass

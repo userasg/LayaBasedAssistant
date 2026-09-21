@@ -71,12 +71,14 @@ def test_a_failed_step_hands_back_to_the_planner_with_the_reason_and_recovers(cu
     assert "could not tell" in planner.calls[1][1] or "no candidate" in planner.calls[1][1]
 
 
-def test_replanning_is_capped(cu_env):
+def test_replanning_is_capped_and_ends_in_a_question_or_a_stall_never_in_free_retrying(cu_env):
     make, page, url = cu_env
     bad = [S("click", "the shopping cart icon")]
     cu, planner = make(bad, bad, bad, bad)
     page.goto(url + "/index.html")
-    assert cu.run("browser", "x").startswith("FAILED") and len(planner.calls) == 3  # first plan + 2 replans
+    out = cu.run("browser", "x")
+    assert out.startswith(("STALLED", "NEEDS_CHOICE")) and len(planner.calls) == 2  # first plan + ONE replan
+    assert cu.blocked_message()  # while it waits, the agent's other tools are refused
 
 
 def test_needs_approval_parks_the_exact_action_and_confirm_performs_it(cu_env):
@@ -140,7 +142,8 @@ def test_an_unavailable_target_is_not_retried_and_tells_the_agent_to_switch_meth
     assert first.startswith("UNAVAILABLE: Google Chrome")
     assert "do NOT call computer_use" in second and "mac_run" in second
     assert calls == ["my_chrome"]  # the second call never even tried: no more retry loops
-    assert use.invoke({"target": "desktop", "goal": "x"}).startswith("UNAVAILABLE")  # a different target is tried on its own
+    assert use.invoke({"target": "desktop", "goal": "x"}).startswith("UNAVAILABLE: target='desktop' needs app=")  # no app named: refused before any driver is touched
+    assert use.invoke({"target": "desktop", "goal": "x", "app": "Notes"}).startswith("UNAVAILABLE")  # a different target is tried on its own
     assert calls == ["my_chrome", "desktop"]
 
 

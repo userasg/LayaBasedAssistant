@@ -25,6 +25,7 @@ from langgraph.errors import GraphRecursionError
 from langgraph.types import Command
 
 from . import agents, config, intake
+from .cua.methods import MethodMemory
 from .cortex import GATE_QUESTIONS
 from .decisions import DecisionLog
 from .engine import llm_lock, make_llm, warm_ollama
@@ -84,15 +85,20 @@ class AssistantSession:
         log = DecisionLog(path=session_dir / "decisions.jsonl")
         shared = SharedFolder(shared_dir)  # a real Mac folder, mounted in the sandbox at /workspace/shared
         handle = make_backend(prefer_docker, shared_dir=shared.root)
+        methods = MethodMemory(config.HOME / "methods.json")  # which way into each app has worked: script, command line or its window
+        if computer is not None and getattr(computer, "methods", None) is None:
+            computer.methods = methods
         agent = agents.build_assistant(predictor=predictor, log=log, sandbox_backend=handle.backend,
-                                       llm=make_llm(config.EXECUTOR_MODEL), shared=shared, computer=computer)
+                                       llm=make_llm(config.EXECUTOR_MODEL), shared=shared, computer=computer, methods=methods)
         fast = make_llm(config.FAST_MODEL, temperature=0.4)
         if warm:
             for m in (config.FAST_MODEL, config.EXECUTOR_MODEL):
                 warm_ollama(m)
             # The first safety-gate call costs ~300 ms (measured: 306 ms cold, 21 ms after); pay it here, not on the person's first command.
             predictor.predict({"command": "ls", "user_request": "hello"}, GATE_QUESTIONS)
-        return cls(predictor, handle, log, agent, fast, session_dir, shared, computer)
+        session = cls(predictor, handle, log, agent, fast, session_dir, shared, computer)
+        session.methods = methods
+        return session
 
     def close(self) -> None:
         self.stop_computer()
@@ -237,14 +243,93 @@ class AssistantSession:
         turn_id = turn_id or uuid.uuid4().hex
         self.meta = self.metas[turn_id] = TurnMeta(route="fast" if fast else "executor", intent=i.intent, laya_ms=i.ms)
         yield Event("intake", i)
+        answered = self._answer_computer_question(text)  # "2": the answer to a pending "which control?" question, resolved by code, no model turn
+        if answered is not None and not answered.startswith("NEEDS_APPROVAL"):
+            yield from self._canned_turn(text, self._present(answered), turn_id)
+            return
+        if self.computer is not None:
+            self.computer.new_request()  # a stalled task or an unanswered question ends here: this request starts clean
+        if answered is not None:  # the chosen action led to an irreversible step: the agent has to ask for the OK (computer_confirm is gated)
+            yield from self._executor_turn(f"Continue the user's computer task. They chose an option and it carried on: {answered}", i, turn_id)
+            return
         opened = self._open_first_clause(text)  # "open Music and play X": Music opens NOW, before any model plans anything
         if opened and opened[1]:
             yield from self._canned_turn(text, f"Opened {opened[0]}.", turn_id)
+            return
+        direct = None if uploads else self._direct_action(text)  # "play X in Music": a verified script, no model at all
+        if direct is not None and (direct.ok or direct.final):
+            yield from self._canned_turn(text, direct.text, turn_id)
         elif fast:
             yield from self._fast_turn(text, turn_id)
         else:
             extra = f"\n\n[Already done: opened {opened[0]} and brought it to the front. Do not open it again.]" if opened else ""
+            extra += self._method_note(text, opened)
+            if direct is not None:  # the fixed script failed (permission, app state): the agent gets the reason instead of starting blind
+                extra += f"\n[A verified script for this already failed: {direct.text} Do not write the same AppleScript again; try another way.]"
             yield from self._executor_turn(text + note + extra, i, turn_id)
+
+    @staticmethod
+    def _present(result: str) -> str:
+        """A computer-use result shown to the user directly: the sentences that instruct the agent are cut, and a stall ends with the question."""
+        if result.startswith("NEEDS_CHOICE"):
+            return result.split("\nAsk the user exactly")[0].replace("NEEDS_CHOICE", "Which one?", 1) + "\nReply with a number."
+        if result.startswith("STALLED"):
+            return result.split(" Do NOT retry")[0] + " How would you like to proceed?"
+        return result
+
+    def _answer_computer_question(self, text: str) -> str | None:
+        """The result of resolving `text` as the user's pick for a pending computer-use question, or None (nothing pending, or not an answer)."""
+        if self.computer is None or not self.computer.pending_choices():
+            return None
+        t0 = time.perf_counter()
+        try:
+            result = self.computer.answer(text)
+        except RuntimeError as e:
+            result = f"UNAVAILABLE: {e}"
+        if result is not None:
+            self.log.add("code", "choice answered", result[:90], None, (time.perf_counter() - t0) * 1000)
+        return result
+
+    def _method_note(self, text: str, opened) -> str:
+        """Script or UI for the app this request is about, decided from facts in code (~0 ms) and handed to the agent as one line, so it neither
+        tries a script on an app that has none nor drives by clicks an app it can script."""
+        from . import app_actions
+        from .cua.apps import host_actions_enabled
+        from .stream_intent import AppIndex
+
+        if not host_actions_enabled():
+            return ""
+        if not hasattr(self, "_app_index"):
+            self._app_index = AppIndex()
+        catalog = self._app_index.catalog
+        found = app_actions.find_app(text, catalog)
+        name = found.name if found else (opened[0] if opened else None)
+        note = app_actions.method_note(name, catalog, getattr(self, "methods", None)) if name else ""
+        if note:
+            self.log.add("code", "method", f"{name}: " + ("script" if "scriptable" in note.split(":")[1][:14] else "ui"), None, 0.0)
+        return "\n" + note if note else ""
+
+    def _direct_action(self, text: str):
+        """A `app_actions.Result` when the whole request is one known action in one scriptable app (play, pause, skip...) and it was run; else None.
+        The script is a verified template, the request is recognised in code and the outcome is read back from the app: nothing here needs a model.
+        With "ask before every command" on, nothing runs silently: the agent's own (gated) path asks."""
+        from . import app_actions, approvals
+        from .cua.apps import host_actions_enabled
+        from .host import _env
+        from .stream_intent import AppIndex
+
+        if not host_actions_enabled() or approvals.current.host_commands == "always_ask":
+            return None
+        if not hasattr(self, "_app_index"):
+            self._app_index = AppIndex()
+        call = app_actions.parse_request(text, self._app_index.catalog)
+        if call is None:
+            return None
+        t0 = time.perf_counter()
+        result = app_actions.run(call.app, call.action, call.arg, env=_env())
+        self.log.add("code", "direct action", f"{call.app}.{call.action}({call.arg}) -> {'ok' if result.ok else 'failed'}: {result.text}"[:120], None,
+                     (time.perf_counter() - t0) * 1000)
+        return result
 
     def _open_first_clause(self, text: str):
         """(app, whole_request_was_just_that) if the request starts with "open <app>" for an installed app, and it was opened; else None.

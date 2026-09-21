@@ -12,10 +12,11 @@ def make_tools(cu):
     def computer_use(target: Literal["browser", "my_chrome", "desktop"], goal: str, max_steps: int = 12, app: str = "") -> str:
         """Click, type and read in a website or app to reach a goal. target='browser' (the default choice) is a browser window this app opens
         and owns: it works immediately, keeps its own logins, and starts on a blank page, so the goal should say where to go. target='my_chrome'
-        is the user's own Chrome (needs setup). target='desktop' drives a Mac app (pass its name in `app`, e.g. app='Notes').
+        is the user's own Chrome (needs setup). target='desktop' drives a Mac app (always pass its name in `app`, e.g. app='Notes').
         Prefer mac_run / mac_notes_create when a script can do the job; use this when something must be clicked or typed on a page. Give the whole goal in plain words ("search for sony headphones and open the first result").
         It plans, acts and checks fast, and returns DONE, NEEDS_USER (a password, captcha or code: tell the user to do it, then call again),
-        NEEDS_APPROVAL (irreversible step: ask the user, then call computer_confirm or computer_cancel), BLOCKED or FAILED."""
+        NEEDS_APPROVAL (irreversible step: ask the user, then call computer_confirm or computer_cancel), NEEDS_CHOICE (ask the user which option, then stop:
+        the answer is handled for you), STALLED (tell the user where it stopped; never retry or script around it), BLOCKED or FAILED."""
         try:
             return cu.run(target, goal, max_steps, app)
         except RuntimeError as e:

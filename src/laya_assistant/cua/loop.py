@@ -13,17 +13,22 @@ verification or an unsure decision hands the step back to the planner instead of
 """
 from __future__ import annotations
 
+import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from . import menu as menu_mod
-from .decide import Decision, decide
+from .cache import DecisionCache
+from .decide import Decision, decide, decide_known
 from .policy import DomainPolicy, Verdict, host_of, validate
 from .recorder import StepRecorder
-from .types import Action, Candidate, Observation, StepPlan
+from .types import Action, Candidate, Element, Observation, StepPlan
 
 BATCHABLE = {"type", "select", "check"}
 MAX_BATCH = 8
+CHOICE_FLOOR = 0.12  # a candidate below this is not a plausible reading of the step: it is never offered to the user
+MAX_CHOICES = 3
+RETRY_WAIT_S = 0.6  # a desktop app updates a moment after an action: an unresolved step gets one more look before anyone is asked
 
 
 @dataclass
@@ -54,12 +59,15 @@ class Pending:
 
 @dataclass
 class RunResult:
-    status: str  # done | failed | needs_approval | needs_user | blocked | stopped
+    status: str  # done | failed | needs_choice | needs_approval | needs_user | blocked | stopped
     results: list[StepResult] = field(default_factory=list)
     next_index: int = 0
     reason: str = ""
     pending: Pending | None = None
     last_obs: Observation | None = None
+    choices: list[Candidate] = field(default_factory=list)  # needs_choice: the plausible elements, best first
+    choice_step: StepPlan | None = None
+    more: bool = False  # done: the plan ended with "more": the goal needs steps that only make sense once the screen has changed
 
     @property
     def ms(self) -> float:
@@ -80,6 +88,46 @@ def to_action(cand: Candidate, step: StepPlan) -> Action:
     return Action(cand.kind, id=cand.cid, value=cand.value)
 
 
+def _label_key(s: str) -> str:
+    return re.sub(r"\s+", " ", s.lower()).strip()
+
+
+def find_element(cand: Candidate, obs: Observation) -> Element | None:
+    """The element `cand` meant, looked up in a NEWER observation. A desktop id is a position in the accessibility tree, so it shifts whenever the
+    UI changes (typing in Messages' search box brings up a results list and every index moves): the id is trusted only while it still names the same
+    thing (same role and label); otherwise the element is found by role and label wherever it went. Judging by id alone reported a successful
+    "type Manjit Gahir" as "field holds None" and sent the task into a re-plan.
+    Measured on the real Messages window: once text is typed, the search field's LABEL becomes that text (it was "Search"), so a field that was
+    just typed into is also recognised by holding, or being named after, what was typed."""
+    want = cand.element
+    if want is None:
+        return obs.by_id(cand.cid)
+    typed = _label_key((cand.value or "")[:120]) if cand.kind == "type" else ""
+
+    def same(e: Element) -> bool:
+        return e.role == want.role and (_label_key(e.label) == _label_key(want.label) or bool(typed and typed in (_label_key(e.value), _label_key(e.label))))
+
+    el = obs.by_id(cand.cid)
+    if el is not None and same(el):
+        return el
+    found = [e for e in obs.elements if same(e)]
+    if not found:
+        return None
+
+    def gap(e: Element) -> int:  # several with the same label (three "Close" buttons): the one nearest where it was
+        try:
+            return abs(int(e.id[1:]) - int(cand.cid[1:]))
+        except ValueError:
+            return 0
+
+    return min(found, key=gap)
+
+
+def _shows(after: Observation, text: str) -> bool:
+    """Is `text` visible anywhere in the window? The fallback when the field itself cannot be found again."""
+    return bool(text) and text.lower() in (after.content or "").lower()
+
+
 def verify(cand: Candidate, before: Observation, after: Observation, res: dict) -> tuple[bool, str]:
     """Did the action land? Judged from the fresh observation, not from any model's confidence."""
     if not res.get("ok"):
@@ -91,12 +139,18 @@ def verify(cand: Candidate, before: Observation, after: Observation, res: dict) 
         return (after.app or "").lower() == (cand.value or "").lower() or bool(after.elements), "the app did not open a window"
     if k == "navigate":
         return (host_of(after.url) == host_of(cand.value) or (after.url or "") != (before.url or "")), "did not reach the page"
-    el_after = after.by_id(cand.cid)
+    el_after = find_element(cand, after)
     if k == "type":
-        got = el_after.value if el_after else None
-        return (got is not None and got.strip() == (cand.value or "").strip()[:120].strip()), f"field holds {got!r}, expected {cand.value!r}"
+        want = (cand.value or "").strip()[:120].strip()
+        if el_after is None:  # the field moved or was renamed: the typed text showing up on screen is the evidence
+            return _shows(after, want), f"the field is gone and {cand.value!r} is not on screen"
+        got = el_after.value
+        return (got is not None and got.strip() == want), f"field holds {got!r}, expected {cand.value!r}"
     if k == "select":
-        return (el_after is not None and (cand.value or "").lower() in el_after.value.lower()), "the option was not selected"
+        option = (cand.value or "").lower()
+        if el_after is None:
+            return _shows(after, option), "the option was not selected"
+        return (option in el_after.value.lower()), "the option was not selected"
     if k == "check":
         want = str(cand.value).lower() not in ("false", "0", "off", "no") if cand.value is not None else True
         return (el_after is not None and el_after.checked == want), "the checkbox did not change"
@@ -107,7 +161,9 @@ def verify(cand: Candidate, before: Observation, after: Observation, res: dict) 
 
 class Loop:
     def __init__(self, driver, predictor, ranker, domain: DomainPolicy | None = None, recorder: StepRecorder | None = None,
-                 llm_tiebreak=None, log=None, allowed_apps: set[str] | None = None, stop_flag=None, sleep_after=0.0):
+                 llm_tiebreak=None, log=None, allowed_apps: set[str] | None = None, stop_flag=None, sleep_after=0.0,
+                 cache: DecisionCache | None = None):
+        self.cache = cache
         self.driver, self.predictor, self.ranker = driver, predictor, ranker
         self.domain = domain or DomainPolicy()
         self.rec = recorder or StepRecorder()
@@ -118,16 +174,58 @@ class Loop:
 
     # -- one step -------------------------------------------------------------------------------------
 
-    def _resolve(self, step: StepPlan, obs: Observation, timings: dict):
+    def _resolve(self, step: StepPlan, obs: Observation, timings: dict, forced: tuple[str, str] | None = None):
+        """(decision, menu). The target is known without asking a model when the user just chose it (`forced`: role, label) or when a cached
+        choice for this exact step still resolves to an element on this screen; otherwise it is decided as before."""
         t0 = time.perf_counter()
         cands = menu_mod.build(step, obs, self.ranker)
         timings["menu_ms"] = (time.perf_counter() - t0) * 1000
-        if not cands:
+        if not cands and forced is None:
             return None, cands
+        known, tier = None, ""
+        if forced is not None:
+            known, tier = self._find(step, obs, cands, forced), "human"
+        elif self.cache is not None and step.do in menu_mod.ROLES_FOR and (hit := self.cache.get(step, obs)) is not None:
+            known, tier = self._find(step, obs, cands, hit, search_all=False), "cache"
         t0 = time.perf_counter()
-        d = decide(step, obs, cands, self.predictor, self.llm_tiebreak)
+        d = decide_known(step, obs, known, cands, self.predictor, tier) if known is not None else decide(step, obs, cands, self.predictor, self.llm_tiebreak)
         timings["decide_ms"] = (time.perf_counter() - t0) * 1000
         return d, cands
+
+    @staticmethod
+    def _find(step: StepPlan, obs: Observation, cands: list[Candidate], want: tuple[str, str], search_all: bool = True) -> Candidate | None:
+        """The candidate for element (role, label). A user's choice may fall outside the shortlist on a changed screen, so it also looks at every element."""
+        role, label = want
+        for c in cands:
+            if c.element is not None and (c.element.role, c.element.label) == (role, label):
+                return c
+        if search_all:
+            for e in obs.elements:
+                if (e.role, e.label) == (role, label) and not e.disabled:
+                    return Candidate(e.id, "click" if step.do == "click" else step.do, e, step.value, 1.0)
+        return None
+
+    @staticmethod
+    def choices_for(cands: list[Candidate]) -> list[Candidate]:
+        """What to offer the user when nothing could be chosen with confidence: the plausible elements, distinct by (role, label), best first."""
+        out, seen = [], set()
+        for c in cands:
+            if c.element is None or c.emb < CHOICE_FLOOR or (c.element.role, c.element.label) in seen:
+                continue
+            seen.add((c.element.role, c.element.label))
+            out.append(c)
+            if len(out) == MAX_CHOICES:
+                break
+        return out
+
+    def _learn(self, r: "StepResult", before: Observation, cand: Candidate, ok: bool) -> None:
+        """Remember a choice that verifiably worked; forget a remembered one that did not."""
+        if self.cache is None or r.decision is None:
+            return
+        if ok and r.decision.tier in ("laya", "llm", "human"):
+            self.cache.put(r.step, before, cand, r.decision.tier)
+        elif not ok and r.decision.tier == "cache":
+            self.cache.evict(r.step, before)
 
     def _validate(self, step: StepPlan, d: Decision, obs: Observation, timings: dict) -> Verdict:
         t0 = time.perf_counter()
@@ -157,6 +255,7 @@ class Loop:
             if record:
                 r.timings["verify_ms"] = (time.perf_counter() - t0) * 1000
                 self.rec.add(kind="outcome", step=r.step.text(), verified=ok, why="" if ok else why)  # joins to the decision row: see authority.py
+                self._learn(r, before, cand, ok)
             if not ok:
                 if record:
                     r.status, r.reason = "failed", why
@@ -175,9 +274,10 @@ class Loop:
             if bad is not None and bad[1].step.do == "click":
                 idx, _, _ = bad
                 cand = next(c for i, c, *_ in awaiting if i == idx)
-                if cand.kind == "click" and cand.cid and getattr(self.driver, "click_by_position", None):
+                el = find_element(cand, obs) if cand.kind == "click" and cand.cid else None  # ids are positions: use where it is NOW
+                if el is not None and getattr(self.driver, "click_by_position", None):
                     for foreground in (False, True):  # the driver's ladder: background pixel click, then the window briefly fronted
-                        if not self.driver.click_by_position(cand.cid, foreground=foreground).get("ok"):
+                        if not self.driver.click_by_position(el.id, foreground=foreground).get("ok"):
                             continue
                         time.sleep(0.9)
                         obs = self.driver.observe()
@@ -185,7 +285,8 @@ class Loop:
                             break
         return self._settle(awaiting, obs), obs
 
-    def run(self, steps: list[StepPlan], start: int = 0, obs: Observation | None = None) -> RunResult:
+    def run(self, steps: list[StepPlan], start: int = 0, obs: Observation | None = None, forced: dict[int, tuple[str, str]] | None = None) -> RunResult:
+        """`forced` maps a step index to the (role, label) of the element the user chose for it."""
         out = RunResult("done", next_index=start)
         i = start
         awaiting: list = []  # (index, candidate, observation before, act result, StepResult): verified by the NEXT observation
@@ -194,7 +295,8 @@ class Loop:
                 out.status, out.reason, out.next_index = "stopped", "stopped by the user", i
                 return out
             step = steps[i]
-            if step.do == "done":
+            if step.do in ("done", "more"):
+                out.more = step.do == "more"
                 break
             timings: dict = {}
             if obs is None or awaiting:  # after any action the page may have changed: look again (this is also the check)
@@ -217,7 +319,13 @@ class Loop:
                     j += 1
             for k, st in enumerate(batch):
                 r = StepResult(st, "ok", timings=dict(timings) if k == 0 else {})
-                d, cands = self._resolve(st, obs, r.timings)
+                spec = (forced or {}).get(i)
+                d, cands = self._resolve(st, obs, r.timings, spec)
+                if (d is None or d.cand is None) and getattr(self.driver, "name", "") == "desktop":
+                    time.sleep(RETRY_WAIT_S)  # cheap local retry: look once more before anyone (a model or the user) is involved
+                    obs = self.driver.observe()
+                    out.last_obs = obs
+                    d, cands = self._resolve(st, obs, r.timings, spec)
                 r.decision = d
                 if d is None or d.cand is None:
                     r.status = "failed"
@@ -225,6 +333,8 @@ class Loop:
                     self._record(st, obs, cands or [], d, None, None, None, False, r.reason, r.timings)
                     out.results.append(r)
                     out.status, out.reason, out.next_index = "failed", r.reason, i
+                    if choices := self.choices_for(cands or []):  # something plausible exists: the user can pick, no model needs to guess
+                        out.status, out.choices, out.choice_step = "needs_choice", choices, st
                     return out
                 r.cand = d.cand
                 v = self._validate(st, d, obs, r.timings)
@@ -237,7 +347,8 @@ class Loop:
                     out.status, out.reason, out.next_index = r.status, v.reason, i
                     if v.action == "ask":
                         self._pid += 1
-                        out.pending = Pending(f"p{self._pid}", i, st, d.cand, v.reason, f"{st.do} {d.cand.label()} ({obs.host or obs.app})")
+                        where = obs.host or (f"{obs.app}: {obs.title[:60]}" if obs.title else obs.app)  # the title names the open conversation or document: WHO a message goes to
+                        out.pending = Pending(f"p{self._pid}", i, st, d.cand, v.reason, f"{st.do} {d.cand.label()} ({where})")
                     return out
                 t0 = time.perf_counter()
                 res = self.driver.act(to_action(d.cand, st))
@@ -267,14 +378,19 @@ class Loop:
     def resume(self, steps: list[StepPlan], pending: Pending) -> RunResult:
         """The user approved `pending`: perform exactly that action, verify it, then carry on with the rest."""
         obs = self.driver.observe()
-        if pending.step.do not in ("navigate", "scroll", "wait") and obs.by_id(pending.cand.cid) is None:
-            return RunResult("failed", reason="the page changed while waiting for your approval", next_index=pending.step_index, last_obs=obs)
+        cand = pending.cand
+        if pending.step.do not in ("navigate", "scroll", "wait"):
+            el = find_element(cand, obs)  # the ids may have moved while the user was deciding; the control itself must still be there
+            if el is None:
+                return RunResult("failed", reason="the page changed while waiting for your approval", next_index=pending.step_index, last_obs=obs)
+            if el.id != cand.cid:
+                cand = replace(cand, cid=el.id, element=el)
         if obs.source == "browser":
             self.domain.approve(obs.url)
-        res = self.driver.act(to_action(pending.cand, pending.step))
+        res = self.driver.act(to_action(cand, pending.step))
         after = self.driver.observe()
-        ok, why = verify(pending.cand, obs, after, res)
-        result = StepResult(pending.step, "ok" if ok else "failed", why, pending.cand)
+        ok, why = verify(cand, obs, after, res)
+        result = StepResult(pending.step, "ok" if ok else "failed", why, cand)
         if not ok:
             return RunResult("failed", [result], pending.step_index, why, last_obs=after)
         rest = self.run(steps, start=pending.step_index + 1, obs=after)

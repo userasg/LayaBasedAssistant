@@ -48,6 +48,7 @@ TOOLS: dict[str, tuple[str, str, str, tuple[str, ...]]] = {
     "computer_cancel": ("⏹", "Dropping the step", "Dropped the step", ()),
     "mac_notes_create": ("🗒", "Making a note", "Made a note", ("title",)),
     "mac_open_app": ("🚀", "Opening an app", "Opened an app", ("name",)),
+    "mac_app_action": ("🎛", "Controlling a Mac app", "Controlled a Mac app", ("app",)),
     "mac_run": ("🖥", "Running on your Mac", "Ran on your Mac", ("command",)),
     "describe_image": ("👁", "Looking at an image", "Looked at an image", ("path",)),
 }
@@ -84,7 +85,7 @@ def describe(name: str, args: dict | None, sub: str | None = None) -> Step:
     return Step(icon, doing, done, clip(detail, 110), sub=sub)
 
 
-_FAIL = re.compile(r"^\s*(FAILED|UNAVAILABLE|BLOCKED|ERROR|Error|Not created|Refused|Traceback)", re.I)
+_FAIL = re.compile(r"^\s*(FAILED|STALLED|UNAVAILABLE|BLOCKED|ERROR|Error|Not created|Refused|Traceback)", re.I)
 _EXIT = re.compile(r"exit(?: code)? (\d+)", re.I)
 
 

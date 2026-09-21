@@ -72,6 +72,17 @@ def laya_pass(predictor, step: StepPlan, obs: Observation, cands: list[Candidate
             cands = cands[:-2]
 
 
+def decide_known(step: StepPlan, obs: Observation, cand: Candidate, cands: list[Candidate], predictor, tier: str) -> Decision:
+    """The target is already known (a cached choice that worked before, or one the user just made), so nothing has to be chosen: no target pass,
+    no LLM tie-break. The safety questions are still asked for a click that is not obviously harmless, exactly as for a fresh decision."""
+    d = Decision(cand, tier, confidence=1.0, margin=1.0)
+    label = cand.element.label if cand.element else ""
+    if cand.kind in ("click", "press_enter") and not SAFE_CLICK.match(label.strip()):
+        a = laya_pass(predictor, step, obs, cands or [cand], want_target=False)
+        d.irreversible, d.needs_user, d.blocked = a["irreversible"]["noul"], a["needs_user"]["noul"], a["blocked"]["noul"]
+    return d
+
+
 def decide(step: StepPlan, obs: Observation, cands: list[Candidate], predictor, llm_tiebreak=None) -> Decision:
     if not cands:
         return Decision(None, "none")

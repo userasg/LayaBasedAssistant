@@ -101,11 +101,12 @@ def test_the_target_is_found_among_thirty_links(env):
     print("30 links:", row["tier"], row["ms"])
 
 
-def test_a_step_with_no_matching_element_fails_instead_of_clicking_something_else(env):
+def test_a_step_with_no_matching_element_stops_and_offers_choices_instead_of_clicking_something_else(env):
     loop, page, url, _ = env
     page.goto(url + "/index.html")
     r = loop.run([S("click", "the shopping cart icon")])
-    assert r.status == "failed" and page.url.endswith("index.html")
+    assert r.status in ("failed", "needs_choice") and page.url.endswith("index.html")  # nothing was clicked either way
+    assert r.status == "failed" or 1 <= len(r.choices) <= 3
 
 
 def test_a_click_that_changes_nothing_is_reported_not_assumed(env):

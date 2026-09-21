@@ -75,7 +75,8 @@ class StepPlan:
         return f"{self.do} {self.target}" + (f" = {self.value!r}" if self.value is not None else "")
 
 
-DO_KINDS = ("click", "type", "select", "check", "press_enter", "scroll", "navigate", "open_app", "wait", "done")
+DO_KINDS = ("click", "type", "select", "check", "press_enter", "scroll", "navigate", "open_app", "wait", "done", "more")
+DESKTOP_KINDS = tuple(k for k in DO_KINDS if k != "navigate")  # a Mac app has no address bar: a plan that navigates is a plan for the wrong surface
 
 
 @dataclass

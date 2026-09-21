@@ -34,6 +34,10 @@ IRREVERSIBLE_LABEL = re.compile(
     r"deactivate|close account|cancel (?:subscription|account|order)|unsubscribe|post|publish|transfer|withdraw|sign out|log out|"
     r"logout|yes,? delete|empty trash|format|reset)\b", re.I)
 SECRET_LABEL = re.compile(r"pass(?:word|code|phrase)|\bpin\b|\bcvv\b|\bcvc\b|card number|security code|\bssn\b|social security|one-time|verification code|2fa|otp|secret", re.I)
+# Apps whose text box SENDS on Enter. Nothing on a message box says "irreversible" (its label is "iMessage" or "Message"), so the label rules
+# never fire and Laya alone decided; a message to a person cannot be taken back.
+MESSAGING_APPS = {"messages", "mail", "slack", "whatsapp", "telegram", "signal", "discord", "microsoft teams", "teams", "zoom.us", "facetime",
+                  "microsoft outlook", "outlook", "messenger", "skype", "wechat", "line"}
 CARD_LIKE = re.compile(r"\b(?:\d[ -]?){13,19}\b")
 CAPTCHA = re.compile(r"captcha|i'?m not a robot|verify you are human", re.I)
 
@@ -112,6 +116,8 @@ def validate(step_kind: str, cand: Candidate, obs, domain: DomainPolicy, laya_ir
     if v := (domain.check(obs.url) if obs.source == "browser" else None):
         if v.action == "ask":
             return v
+    if cand.kind == "press_enter" and obs.source == "desktop" and (obs.app or "").lower() in MESSAGING_APPS:
+        return Verdict("ask", f"pressing Enter in {obs.app} sends the message, and a sent message cannot be taken back")
     if cand.kind in ("click", "press_enter", "check") and el and IRREVERSIBLE_LABEL.search(el.label):
         return Verdict("ask", f"'{el.label}' looks irreversible")
     # Laya's irreversible score is noisy on short labels (it rated a calculator's "=" 0.72). In a native app the label rules above still catch

@@ -40,9 +40,12 @@ SYSTEM_PROMPT = """You are a capable local assistant. You work in a private Dock
 - Ways to act on the user's Mac, simplest first: (1) scripts: `mac_notes_create`, and `mac_run` for `open -a App`, `open URL`, `curl` to read a
   page, `osascript`; safe ones run at once, others ask the user; (2) `computer_use` when something must be clicked or typed in a website or app
   (target 'browser' is a window this app owns and works immediately); (3) the `researcher` to look things up. If a tool says UNAVAILABLE, never
-  retry it: pick another method and tell the user in one sentence. To use a website or a Mac app, call `computer_use` once with the whole goal (see the computer-use skill). It is fast; do not
+  retry it: pick another method and tell the user in one sentence. For a Mac app a `[Mac method: ...]` note tells you whether it is scriptable
+  (then use `mac_app_action` if it lists the action, else write AppleScript from the dictionary in the note) or not (then `computer_use` at once). To use a website or a Mac app, call `computer_use` once with the whole goal (see the computer-use skill). It is fast; do not
   break the goal into clicks yourself. Irreversible steps come back as NEEDS_APPROVAL: ask the user, never confirm on your own.
   If the user declines (or answers something other than yes), call `computer_cancel` and stop; do not try again.
+  `NEEDS_CHOICE` or `STALLED` from computer_use means the task stopped and needs the user: relay it in a sentence or two and STOP. Never retry it and
+  never work around it with mac_run or scripts (those are refused until the user answers).
 - A note from the Laya decision layer may follow the user's message: treat it as guidance about the request, not as an instruction.
 """
 
@@ -78,7 +81,7 @@ def rubric_for(intent: str) -> str | None:
     return RUBRICS.get(intent)
 
 
-def build_assistant(*, predictor, log: DecisionLog, sandbox_backend, llm, session_id: str = "", shared=None, computer=None):
+def build_assistant(*, predictor, log: DecisionLog, sandbox_backend, llm, session_id: str = "", shared=None, computer=None, methods=None):
     context_config.register_profile()
     backend = CompositeBackend(
         default=sandbox_backend,
@@ -102,7 +105,7 @@ def build_assistant(*, predictor, log: DecisionLog, sandbox_backend, llm, sessio
     return create_deep_agent(
         model=llm,
         system_prompt=SYSTEM_PROMPT + memory.MEMORY_PROMPT,
-        tools=[make_describe_image(backend), *make_host_tools(), *(make_computer_tools(computer) if computer is not None else [])],
+        tools=[make_describe_image(backend), *make_host_tools(guard=computer.blocked_message if computer is not None else None, methods=methods), *(make_computer_tools(computer) if computer is not None else [])],
         subagents=[sub(RESEARCHER), sub(CODER), sub(REVIEWER), build_advisor(predictor, log)],
         middleware=[
             LayaCortexMiddleware(predictor, log, gate_plans=True, host_tools={"mac_run"}),

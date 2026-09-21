@@ -117,7 +117,8 @@ def render_computer_panel(session: AssistantSession, bridge, domain, cli) -> Non
         if rows:
             st.caption(f"Laya agreed with the final choice on {sum(r['agreement'] for r in rows)}/{len(rows)} ambiguous steps")
         tiers = [r["tier"] for r in cu.rec.rows if "tier" in r]
-        st.caption(f"{len(tiers)} steps recorded · {tiers.count('code')} by code, {tiers.count('laya')} Laya, {tiers.count('llm')} LLM")
+        st.caption(f"{len(tiers)} steps recorded · {tiers.count('code')} by code, {tiers.count('cache')} remembered, "
+                   f"{tiers.count('laya')} Laya, {tiers.count('llm')} LLM, {tiers.count('human')} you")
         st.caption(authority.summary_line(cu.rec.rows))
 
     with st.expander("Advanced (optional): Chrome extension for precise tab control"):

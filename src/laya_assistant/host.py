@@ -17,10 +17,11 @@ import time
 
 from langchain_core.tools import tool
 
-from . import config
+from . import app_actions, approvals, config
 
 HOST_SWITCH = "LAYA_HOST_ACTIONS"  # "off": the tools run nothing (test runs, demos). A run must never touch the real Notes app or open windows.
 SWITCHED_OFF = f"SKIPPED: host actions are switched off in this run ({HOST_SWITCH}=off); nothing was run on the Mac."
+SCRIPT_REFUSAL_S = 300  # after this long a script for an app that kept failing is allowed again
 DUPLICATE_WINDOW_S = 600  # the same note (title and text) is created once per ten minutes: a re-planning agent must not litter Notes
 
 NOTES_SCRIPT = '''on run argv
@@ -35,6 +36,7 @@ _SAFE = [
     re.compile(r"^open -a ['\"]?[\w .+-]+['\"]?$"),  # no & ; | ` $ : an app name, never a second command
     re.compile(r"^open https?://[^\s;|&<>`$]+$"),
     re.compile(r"^open -R [~/][\w ./~-]*$"),
+    re.compile(r"^(?:code|cursor|subl|zed)(?: -[rnw])? ['\"]?[~/][\w ./~-]*['\"]?$"),  # open a folder or file in an editor (it changes nothing)
     re.compile(r"^curl -[sSLfI]+ https?://[^\s;|&<>`$]+$"),
     re.compile(r"^(date|pwd|whoami|uptime)$"),
     re.compile(r"^say [\w ,.'!?-]{1,200}$"),
@@ -68,11 +70,15 @@ def _catalog():
     return _CATALOG
 
 
-def make_host_tools(runner=None):
-    """`runner` is `subprocess.run` unless a test passes a recorder. With no runner and LAYA_HOST_ACTIONS=off the tools do nothing."""
+def make_host_tools(runner=None, guard=None, methods=None):
+    """`runner` is `subprocess.run` unless a test passes a recorder. With no runner and LAYA_HOST_ACTIONS=off the tools do nothing.
+    `guard()` returns a reason when `mac_run` must not act right now (a computer-use task is stalled and waiting for the user), else None.
+    `methods` (cua/methods.py) is told which scripts worked, so the next request about that app starts with the way in that works."""
     off = runner is None and os.getenv(HOST_SWITCH, "on").strip().lower() == "off"
     runner = runner or subprocess.run
     made: dict[tuple[str, str], float] = {}  # (title, text) -> when it was created
+    script_fails: dict[str, int] = {}  # app -> osascript failures in a row
+    failed_at: dict[str, float] = {}  # app -> when the last one failed (a refusal lapses: the user may have fixed a permission)
 
     @tool
     def mac_notes_create(title: str, body: str) -> str:
@@ -101,12 +107,47 @@ def make_host_tools(runner=None):
         anything else asks the user first (they answer in the text box); dangerous ones are refused. Say why in `reason`."""
         if off:
             return SWITCHED_OFF
+        if guard is not None and (why := guard()):
+            return why
+        if "osascript" in command and (app := app_actions.osascript_app(command)) and script_fails.get(app, 0) >= app_actions.SWITCH_AFTER \
+                and time.monotonic() - failed_at.get(app, 0) < SCRIPT_REFUSAL_S:
+            # the fall-through is enforced here, not left to the model: a 14B that is told to switch keeps writing scripts
+            return (f"NOT RUN: scripts for {app} failed {script_fails[app]} times just now. Do not write another: work in its window with "
+                    f"computer_use(target='desktop', app='{app}').")
         try:
             p = runner(["/bin/zsh", "-c", command], capture_output=True, text=True, timeout=30, env=_env(), cwd=str(config.HOME))
         except subprocess.TimeoutExpired:
             return "FAILED: the command took longer than 30 s and was stopped."
         out = ((p.stdout or "") + (("\n[stderr] " + p.stderr) if p.stderr.strip() else ""))[:4000]
-        return f"exit {p.returncode}\n{out}".strip()
+        advice = ""
+        if "osascript" in command and (app := app_actions.osascript_app(command)):
+            if methods is not None:
+                methods.record(app, "script", p.returncode == 0)
+            if p.returncode == 0:
+                script_fails.pop(app, None)
+            else:
+                script_fails[app] = script_fails.get(app, 0) + 1
+                failed_at[app] = time.monotonic()
+                advice = app_actions.osascript_advice(p.stderr)
+                if script_fails[app] >= app_actions.SWITCH_AFTER:  # stop paying a model turn per failed script: the UI is the way in
+                    advice += f" Scripting {app} has failed {script_fails[app]} times: stop, and use computer_use(target='desktop', app='{app}')."
+        return f"exit {p.returncode}\n{out}{chr(10) + '[hint] ' + advice.strip() if advice else ''}".strip()
+
+    @tool(description=(
+        "Do a common thing in a scriptable Mac app with a verified script (no AppleScript to write, and it reads the result back). "
+        "Available: " + app_actions.describe() + ". `arg` is the playlist or song name for the play_* actions. Prefer this to mac_run + osascript "
+        "and to computer_use whenever the app and action are listed; if it answers NO_TEMPLATE, use the other tools."))
+    def mac_app_action(app: str, action: str, arg: str = "") -> str:
+        if off:
+            return SWITCHED_OFF
+        if approvals.current.host_commands == "always_ask":
+            return "NOT RUN: the user wants every command on their Mac approved first. Use mac_run so they are asked."
+        resolved = _catalog().resolve(app)
+        name = resolved.name if resolved else app
+        if (name, action) not in app_actions.TEMPLATES:
+            return f"NO_TEMPLATE: nothing ready for {action!r} in {name!r}. Ready-made: {app_actions.describe()}."
+        r = app_actions.run(name, action, arg, runner=runner, env=_env())
+        return r.text if r.ok else f"FAILED: {r.text}"
 
     @tool
     def mac_open_app(name: str) -> str:
@@ -131,9 +172,9 @@ def make_host_tools(runner=None):
 
             reopen_and_activate(found.name)
             return f"Opened {found.name} (window state not checked: the desktop driver is not running)."
-        script = " It has a scripting dictionary: prefer AppleScript via mac_run." if catalog.scripting(found.name) else ""
+        script = ("\n" + app_actions.method_note(found.name, catalog, methods)) if found.name not in app_actions._BROWSERS else ""
         if presence.ok:
             return f"Opened {found.name}; its window is on screen.{script}"
         return f"Opened {found.name}, but: {presence.reason}{script}"
 
-    return [mac_notes_create, mac_run, mac_open_app]
+    return [mac_notes_create, mac_app_action, mac_run, mac_open_app]

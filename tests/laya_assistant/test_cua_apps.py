@@ -111,7 +111,7 @@ def test_the_open_app_tool_finds_the_app_says_what_it_can_do_and_never_guesses(m
     monkeypatch.setattr(apps, "bring_up", lambda name, cli, **kw: apps.Presence(True, name, 1, 2))
     tool = {t.name: t for t in host.make_host_tools()}["mac_open_app"]
     ok = tool.invoke({"name": "apple music"})
-    assert ok.startswith("Opened Music; its window is on screen") and "scripting dictionary" in ok  # Music ships a dictionary in the fixture
+    assert ok.startswith("Opened Music; its window is on screen") and "scriptable" in ok  # Music ships a dictionary in the fixture: the method note says to script it
     assert tool.invoke({"name": "photoshop"}).startswith("UNAVAILABLE") and "Do not guess" in tool.invoke({"name": "photoshop"})
     monkeypatch.setattr(apps, "bring_up", lambda name, cli, **kw: apps.Presence(False, name, reason="its window is on another desktop"))
     assert "another desktop" in tool.invoke({"name": "notes"})

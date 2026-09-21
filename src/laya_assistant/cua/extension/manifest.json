@@ -1,0 +1,10 @@
+{
+  "manifest_version": 3,
+  "name": "Laya Bridge",
+  "version": "0.1.0",
+  "description": "Lets the Laya Assistant on this computer operate the browser tabs you explicitly hand it. Nothing else.",
+  "permissions": ["tabs", "scripting", "storage", "activeTab"],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "background.js" },
+  "action": { "default_popup": "popup.html", "default_title": "Laya Bridge" }
+}

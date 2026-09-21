@@ -1,0 +1,173 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  :root { --fg: #31333f; --accent: #ff4b4b; --ok: #16a34a; --line: rgba(128,128,128,.38); --box: rgba(128,128,128,.10); --muted: color-mix(in srgb, var(--fg) 58%, transparent); }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: "Source Sans", -apple-system, system-ui, sans-serif; color: var(--fg); background: transparent; }
+  #row { display: flex; align-items: center; gap: 10px; min-height: 38px; }
+  button { font: inherit; font-size: 14px; padding: 7px 16px; border-radius: 999px; border: 1px solid var(--line); background: transparent; color: var(--fg); cursor: pointer; white-space: nowrap; }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button.on { background: var(--accent); color: #fff; border-color: var(--accent); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  #hint { font-size: 13px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  #timer { display: none; font-variant-numeric: tabular-nums; font-size: 13px; color: var(--accent); }
+  #meter { display: none; width: 72px; height: 6px; border-radius: 3px; background: var(--box); overflow: hidden; }
+  #meter i { display: block; height: 100%; width: 0; background: var(--ok); transition: width .09s linear; }
+  #live { display: none; margin-top: 8px; padding: 9px 12px; border: 1px solid var(--line); border-radius: 10px; font-size: 15px; line-height: 1.4; background: var(--box); white-space: pre-wrap; }
+  #live.empty { color: var(--muted); }
+  #chips { font-size: 12px; color: var(--muted); }
+  #chips:not(:empty) { margin-top: 5px; }
+  #acts { font-size: 13px; color: var(--ok); }
+  #acts:not(:empty) { margin-top: 3px; }
+  body.listening #timer, body.listening #meter, body.listening #live { display: block; }
+  body.listening #timer { display: inline; }
+  body.listening #meter { display: inline-block; }
+  body.listening #hint { display: none; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); margin-right: 6px; animation: pulse 1s infinite; }
+  @keyframes pulse { 50% { opacity: .25; } }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="row">
+    <button id="btn">🎙 Talk</button>
+    <span id="timer"><span class="dot"></span><span id="clock">0:00</span></span>
+    <span id="meter"><i></i></span>
+    <span id="hint">Say what you need. Simple commands like “open Notes” start while you are still speaking.</span>
+  </div>
+  <div id="live" class="empty">Listening...</div>
+  <div id="chips"></div>
+  <div id="acts"></div>
+</div>
+<script>
+const post = (type, data) => window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type }, data || {}), "*");
+const $ = id => document.getElementById(id);
+let port = 8765, ws = null, ctx = null, proc = null, stream = null, listening = false, finalText = "", began = 0, clock = null, level = 0;
+
+// Measure the content, never documentElement.scrollHeight: that is >= the iframe's own height, so
+// reporting it back grows the frame by a few pixels on every render until it swallows the page.
+function height() { post("streamlit:setFrameHeight", { height: Math.ceil($("wrap").getBoundingClientRect().height) + 4 }); }
+window.addEventListener("message", e => {
+  if (e.data && e.data.type === "streamlit:render") {
+    const th = e.data.theme;  // follow the app's own light/dark theme, not the operating system's
+    if (th && th.textColor) document.documentElement.style.setProperty("--fg", th.textColor);
+    if (th && th.primaryColor) document.documentElement.style.setProperty("--accent", th.primaryColor);
+    port = (e.data.args && e.data.args.port) || port;
+    if (!listening) $("btn").disabled = !!(e.data.args && e.data.args.disabled);
+    if (!listening && e.data.args && e.data.args.disabled && !finalText) $("hint").textContent = "Busy: I will listen again when this is done.";
+    else if (!listening && !finalText) $("hint").textContent = "Say what you need. Simple commands like “open Notes” start while you are still speaking.";
+    height();
+  }
+});
+post("streamlit:componentReady", { apiVersion: 1 });
+height();
+
+function show(d) {
+  const live = $("live");
+  live.classList.toggle("empty", !d.text);
+  live.textContent = d.text || (listening ? "Listening..." : "");
+  const i = d.intake;
+  $("chips").textContent = i ? `🟢 Laya (live): ${i.intent} · ${i.route === "fast" ? "⚡ fast model" : "🧠 Deep Agent"} · risk ${i.risky.toFixed(2)} · ${Math.round(i.ms)} ms` : "";
+  height();
+}
+
+function tick() {
+  const s = Math.floor((Date.now() - began) / 1000);
+  $("clock").textContent = `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+
+async function start() {
+  finalText = "";
+  $("acts").textContent = "";
+  $("hint").textContent = "connecting...";
+  ws = new WebSocket(`ws://${location.hostname}:${port}/stt`);
+  ws.binaryType = "arraybuffer";
+  await new Promise((res, rej) => { ws.onopen = res; ws.onerror = () => rej(new Error(`voice server not reachable on port ${port}`)); });
+  ws.onmessage = ev => {
+    const d = JSON.parse(ev.data);
+    if (d.type === "commit") {   // an early, reversible action ran while you were still speaking
+      const line = document.createElement("div");
+      line.textContent = (d.result.ok ? "⚡ " : "⚠️ ") + d.result.text + ` (${Math.round(d.result.ms)} ms, while you were speaking)`;
+      $("acts").appendChild(line); height(); return;
+    }
+    show(d); if (d.type === "final") done(d);
+  };
+  ws.send(JSON.stringify({ type: "start" }));
+  stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } });
+  ctx = new (window.AudioContext || window.webkitAudioContext)();
+  const src = ctx.createMediaStreamSource(stream);
+  proc = ctx.createScriptProcessor(4096, 1, 1);
+  const ratio = ctx.sampleRate / 16000;
+  proc.onaudioprocess = e => {
+    const input = e.inputBuffer.getChannelData(0);
+    let sum = 0;
+    for (let i = 0; i < input.length; i += 8) sum += input[i] * input[i];   // a cheap level reading for the meter
+    level = Math.sqrt(sum / (input.length / 8));
+    $("meter").firstElementChild.style.width = Math.min(100, level * 600) + "%";
+    const n = Math.floor(input.length / ratio);
+    const out = new Int16Array(n);
+    for (let i = 0; i < n; i++) {           // average-pool down to 16 kHz (cheap anti-aliasing)
+      const a = Math.floor(i * ratio), b = Math.min(input.length, Math.floor((i + 1) * ratio));
+      let s = 0; for (let j = a; j < b; j++) s += input[j];
+      const v = Math.max(-1, Math.min(1, s / Math.max(1, b - a)));
+      out[i] = v * 32767;
+    }
+    if (ws && ws.readyState === 1) ws.send(out.buffer);
+  };
+  const mute = ctx.createGain(); mute.gain.value = 0;
+  src.connect(proc); proc.connect(mute); mute.connect(ctx.destination);
+  listening = true;
+  began = Date.now(); tick(); clock = setInterval(tick, 500);
+  document.body.classList.add("listening");
+  $("btn").textContent = "⏹ Stop"; $("btn").classList.add("on");
+  $("live").classList.add("empty"); $("live").textContent = "Listening..."; $("chips").textContent = "";
+  height();
+}
+
+function teardown() {
+  try { if (proc) { proc.disconnect(); proc.onaudioprocess = null; } } catch (e) {}
+  try { if (ctx) ctx.close(); } catch (e) {}
+  try { if (stream) stream.getTracks().forEach(t => t.stop()); } catch (e) {}
+  try { clearInterval(clock); } catch (e) {}
+  proc = ctx = stream = clock = null;
+  $("meter").firstElementChild.style.width = "0";
+}
+
+function stop() {
+  listening = false;
+  teardown();
+  $("btn").disabled = true; $("btn").textContent = "Finishing..."; $("btn").classList.remove("on");
+  $("hint").textContent = "transcribing the end...";
+  document.body.classList.remove("listening");
+  height();
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "stop" }));
+}
+
+function done(d) {
+  try { ws.close(); } catch (e) {}
+  finalText = d.text || "";
+  $("btn").disabled = false; $("btn").textContent = "🎙 Talk";
+  $("hint").textContent = d.text ? "Got it: your words are in the box above. Fix anything, then Send." : "I heard nothing. Check the microphone and try again.";
+  // the text moves to the app (an editable box); clearing here avoids showing it twice
+  $("live").classList.add("empty"); $("live").textContent = ""; $("chips").textContent = "";
+  document.body.classList.remove("listening");
+  height();
+  post("streamlit:setComponentValue", { dataType: "json", value: { text: d.text, remaining: d.remaining, done: d.done || [], nonce: Date.now(), ms: d.ms, seconds: d.seconds, intake: d.intake } });
+}
+
+$("btn").onclick = async () => {
+  if (listening) return stop();
+  try { await start(); }
+  catch (err) {
+    teardown(); listening = false;
+    document.body.classList.remove("listening");
+    $("btn").textContent = "🎙 Talk"; $("btn").classList.remove("on");
+    $("hint").textContent = "Could not start: " + (err && err.message ? err.message : err);
+    height();
+  }
+};
+</script>
+</body>
+</html>

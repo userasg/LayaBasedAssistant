@@ -1,0 +1,11 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Get started - step 1</title></head><body>
+<h1 id="h">Step 1: Your name</h1>
+<div id="s1"><label>Full name <input id="n"></label> <button id="b1">Next</button></div>
+<div id="s2" hidden><label><input type="radio" name="plan" value="free"> Free plan</label> <label><input type="radio" name="plan" value="pro"> Pro plan</label> <button id="b2">Next</button></div>
+<div id="s3" hidden><p id="rev"></p><button id="b3">Finish</button></div>
+<script>
+const $ = id => document.getElementById(id);
+$('b1').onclick = () => { $('s1').hidden = true; $('s2').hidden = false; $('h').textContent = 'Step 2: Choose a plan'; document.title = 'Get started - step 2'; };
+$('b2').onclick = () => { const p = document.querySelector('input[name=plan]:checked'); $('s2').hidden = true; $('s3').hidden = false; $('h').textContent = 'Step 3: Review'; $('rev').textContent = 'Name: ' + $('n').value + ', plan: ' + (p ? p.value : 'none'); document.title = 'Get started - step 3'; };
+$('b3').onclick = () => { $('s3').hidden = true; $('h').textContent = 'All done'; document.title = 'Finished'; };
+</script></body></html>

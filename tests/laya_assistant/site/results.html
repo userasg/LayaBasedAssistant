@@ -1,0 +1,10 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Results</title></head><body>
+<h1>Results</h1><input type="search" name="q" placeholder="Search products" aria-label="Search products" id="q"><button id="go">Search</button>
+<ul id="list"></ul>
+<script>
+const q = new URLSearchParams(location.search).get('q') || '';
+const items = ['Bose QuietComfort 45 Headphones','Sony WH-1000XM5 Wireless Headphones','Sony WH-CH520 On-Ear Headphones','Apple AirPods Pro','Anker Soundcore Earbuds'];
+const list = document.getElementById('list');
+items.filter(i => i.toLowerCase().includes(q.toLowerCase())).forEach(i => { const li = document.createElement('li'); const a = document.createElement('a'); a.href = '#'; a.textContent = i; a.onclick = e => { e.preventDefault(); document.title = 'Product: ' + i; document.body.insertAdjacentHTML('beforeend', '<h2>' + i + '</h2><p>Price: $349</p>'); }; li.appendChild(a); list.appendChild(li); });
+document.getElementById('go').onclick = () => { location.href = 'results.html?q=' + encodeURIComponent(document.getElementById('q').value); };
+</script></body></html>

@@ -1,0 +1,8 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Account settings</title></head><body>
+<h1>Account settings</h1>
+<button id="rename">Rename workspace</button> <button id="del">Delete account</button> <button id="export">Export data</button>
+<div id="dlg" role="dialog" aria-modal="true" hidden><p>Are you sure? This cannot be undone.</p><button id="cancel">Cancel</button> <button id="yes">Yes, delete everything</button></div>
+<script>document.getElementById('del').onclick = () => { document.getElementById('dlg').hidden = false; };
+document.getElementById('cancel').onclick = () => { document.getElementById('dlg').hidden = true; };
+document.getElementById('yes').onclick = () => { document.title = 'Account deleted'; document.body.insertAdjacentHTML('beforeend', '<p>Account deleted.</p>'); };
+document.getElementById('export').onclick = () => { document.title = 'Export started'; };</script></body></html>
